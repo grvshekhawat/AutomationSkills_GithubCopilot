@@ -35,11 +35,12 @@ gh skill preview <owner>/<this-repo> feature-to-wdio-page-objects
 ## Peer requirements (consumer WDIO project)
 
 - Node.js 18+
-- `webdriverio` installed in the project
-- A `wdio.conf.js` / `wdio.conf.ts` (or pass `--wdio-config`)
-- Browser driver reachable as configured (Chrome/ChromeDriver, Selenium Grid, etc.)
-- Application under test reachable at `baseUrl`
+- `webdriverio` installed in the project (it **starts ChromeDriver** and opens Chrome)
+- Chrome installed locally
+- App URL via `wdio.conf` `baseUrl` or `--base-url`
 - UI elements tagged with your locator attribute (default `test-automation-id`), or a parent wrapper that has it
+
+Do not require a Selenium server on `localhost:4444`. Pass `--headless` to hide the window; default is a visible Chrome session.
 
 Optional project config (copy from the skill):
 
@@ -61,12 +62,13 @@ wdio.conf.*
 From the **WDIO project root**:
 
 ```bash
-# 1) Drive feature → trace + locators
+# 1) Open Chrome, run each step, record locators
 node .github/skills/feature-to-wdio-page-objects/scripts/drive-feature.mjs \
   --feature features/login.feature \
   --project-root . \
   --out .pom-discover \
-  --locator-attribute test-automation-id
+  --locator-attribute test-automation-id \
+  --base-url https://staging.example.com
 
 # 2) Merge into page objects
 node .github/skills/feature-to-wdio-page-objects/scripts/merge-page-object.mjs \
@@ -82,6 +84,8 @@ Outputs:
 | `.pom-discover/trace.json` | Full step execution record |
 | `.pom-discover/gaps.json` | Missing attribute / ambiguous / unsupported steps |
 | `.pom-discover/locators.json` | Locators grouped by page key for merge |
+
+The driver walks steps in order: login (username + password + submit from a data table), then `I enter my name`, `I click submit`, and so on — each action is performed in Chrome before the locator is saved.
 
 ## Locator policy
 
