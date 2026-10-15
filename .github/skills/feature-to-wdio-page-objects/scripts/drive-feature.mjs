@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * Drive a WebdriverIO browser through UI-language Cucumber steps and record
- * strict attribute locators to trace.json (+ gaps.json).
+ * Open Chrome (ChromeDriver via WebdriverIO), run each UI-language Cucumber
+ * step, and record strict attribute locators.
  *
  * Usage (from a WDIO project root):
  *   node <skill>/scripts/drive-feature.mjs \
  *     --feature features/login.feature \
  *     --project-root . \
- *     --out .pom-discover
+ *     --out .pom-discover \
+ *     --base-url https://staging.example.com
  */
 
 import fs from 'node:fs'
@@ -36,7 +37,9 @@ function parseArgs(argv) {
     locatorAttribute: null,
     wdioConfig: null,
     scenario: null,
-    headless: true,
+    headless: null,
+    baseUrl: null,
+    startUrl: null,
   }
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i]
@@ -49,6 +52,9 @@ function parseArgs(argv) {
     else if (a === '--wdio-config') out.wdioConfig = argv[++i]
     else if (a === '--scenario') out.scenario = argv[++i]
     else if (a === '--headed') out.headless = false
+    else if (a === '--headless') out.headless = true
+    else if (a === '--base-url') out.baseUrl = argv[++i]
+    else if (a === '--start-url' || a === '--url') out.startUrl = argv[++i]
     else if (a === '--help' || a === '-h') out.help = true
   }
   return out
@@ -77,7 +83,6 @@ async function loadWdioConfig(projectRoot, explicit) {
       const cfg = mod.config || mod.default?.config || mod.default
       if (cfg) return { file, config: cfg }
     } catch (err) {
-      // TS configs may fail without a loader — try require for CJS
       try {
         const require = createRequire(path.join(projectRoot, 'package.json'))
         const mod = require(file)
@@ -85,7 +90,7 @@ async function loadWdioConfig(projectRoot, explicit) {
         if (cfg) return { file, config: cfg }
       } catch {
         console.warn(
-          `Could not load ${file}: ${err.message}. Continuing with defaults.`
+          `Could not load ${file}: ${err.message}. Will start local Chrome instead.`
         )
       }
     }
@@ -94,13 +99,19 @@ async function loadWdioConfig(projectRoot, explicit) {
 }
 
 /**
+ * Start a real Chrome session. Do NOT default to localhost:4444 — that assumes
+ * a Selenium server. WDIO `remote()` starts ChromeDriver when hostname/port
+ * are omitted.
+ *
  * @param {string} projectRoot
+ * @param {object} wdioConfig
+ * @param {boolean} headless
+ * @param {string} baseUrl
  */
-async function createBrowser(projectRoot, wdioConfigFile, wdioConfig, headless) {
+async function createBrowser(projectRoot, wdioConfig, headless, baseUrl) {
   let remote
   try {
     const require = createRequire(path.join(projectRoot, 'package.json'))
-    // Resolve webdriverio from the consumer project
     const wdioPath = require.resolve('webdriverio')
     ;({ remote } = await import(pathToFileURL(wdioPath).href))
   } catch {
@@ -108,67 +119,273 @@ async function createBrowser(projectRoot, wdioConfigFile, wdioConfig, headless) 
       ;({ remote } = await import('webdriverio'))
     } catch {
       throw new Error(
-        'webdriverio is not installed. Run this script from a WDIO project (npm i webdriverio) or install webdriverio as a dependency.'
+        'webdriverio is not installed. From your WDIO project run: npm i -D webdriverio. The driver starts local Chrome via ChromeDriver (do not point at localhost:4444 unless you already have a Selenium server).'
       )
     }
   }
 
-  const caps = {
-    ...(wdioConfig.capabilities?.[0] ||
-      wdioConfig.capabilities ||
-      {
-        browserName: 'chrome',
-      }),
+  const rawCaps = Array.isArray(wdioConfig.capabilities)
+    ? wdioConfig.capabilities[0]
+    : wdioConfig.capabilities
+  const capability = {
+    browserName: 'chrome',
+    ...(rawCaps && typeof rawCaps === 'object' ? rawCaps : {}),
+  }
+  if (!capability.browserName) capability.browserName = 'chrome'
+
+  const chromeOpts = { ...(capability['goog:chromeOptions'] || {}) }
+  const args = [...(chromeOpts.args || [])]
+  if (headless) {
+    for (const flag of ['--headless=new', '--disable-gpu', '--window-size=1920,1080']) {
+      if (!args.includes(flag)) args.push(flag)
+    }
+  } else {
+    if (!args.includes('--window-size=1920,1080')) args.push('--window-size=1920,1080')
+  }
+  capability['goog:chromeOptions'] = { ...chromeOpts, args }
+
+  /** @type {Record<string, unknown>} */
+  const opts = {
+    logLevel: wdioConfig.logLevel || 'error',
+    baseUrl: baseUrl || wdioConfig.baseUrl || '',
+    capabilities: capability,
+    waitforTimeout: wdioConfig.waitforTimeout || 10000,
+    connectionRetryTimeout: wdioConfig.connectionRetryTimeout || 180000,
+    connectionRetryCount: wdioConfig.connectionRetryCount ?? 3,
   }
 
-  // Normalize single capability object
-  const capability = Array.isArray(wdioConfig.capabilities)
-    ? { ...wdioConfig.capabilities[0] }
-    : { ...caps }
+  // Only attach a remote server if the project config explicitly has one.
+  if (wdioConfig.hostname) opts.hostname = wdioConfig.hostname
+  if (wdioConfig.port) opts.port = wdioConfig.port
+  if (wdioConfig.path) opts.path = wdioConfig.path
+  if (wdioConfig.protocol) opts.protocol = wdioConfig.protocol
+  if (wdioConfig.user) opts.user = wdioConfig.user
+  if (wdioConfig.key) opts.key = wdioConfig.key
+  if (wdioConfig.automationProtocol) {
+    opts.automationProtocol = wdioConfig.automationProtocol
+  }
 
-  if (headless) {
-    const browserName = (capability.browserName || 'chrome').toLowerCase()
-    if (browserName.includes('chrome') || browserName.includes('chromium')) {
-      capability['goog:chromeOptions'] = {
-        ...(capability['goog:chromeOptions'] || {}),
-        args: [
-          ...new Set([
-            ...((capability['goog:chromeOptions'] || {}).args || []),
-            '--headless',
-            '--disable-gpu',
-            '--window-size=1920,1080',
-          ]),
-        ],
+  console.error(
+    headless
+      ? 'Starting Chrome (headless) via WebdriverIO/ChromeDriver…'
+      : 'Opening Chrome via WebdriverIO/ChromeDriver…'
+  )
+
+  const browser = await remote(opts)
+  return { browser, baseUrl: String(opts.baseUrl || '') }
+}
+
+/**
+ * @param {string} dest
+ * @param {string} baseUrl
+ */
+function resolveUrl(dest, baseUrl) {
+  const d = String(dest || '').trim()
+  if (!d) return baseUrl || ''
+  if (/^https?:\/\//i.test(d) || d.startsWith('file:')) return d
+  if (d.startsWith('/')) {
+    if (!baseUrl) return d
+    return new URL(d, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).href
+  }
+  if (!baseUrl) return d
+  return new URL(d.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).href
+}
+
+async function currentPage(browser) {
+  const url = await browser.getUrl()
+  return { url, pageKey: pageNameFromUrl(url) }
+}
+
+/**
+ * @param {import('webdriverio').Browser} browser
+ * @param {object} uiStep
+ * @param {object} config
+ * @param {string} locatorAttribute
+ */
+async function collectAndPick(browser, uiStep, config, locatorAttribute) {
+  const collectFn = browserCollectCandidates()
+  const candidates = await browser.execute(collectFn, locatorAttribute)
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return {
+      match: null,
+      ambiguous: [],
+      scores: [],
+      gapReason: `no elements with [${locatorAttribute}] are visible on this page`,
+    }
+  }
+  return pickBestCandidate(
+    candidates,
+    uiStep,
+    locatorAttribute,
+    config.minScore,
+    config.ambiguityDelta
+  )
+}
+
+/**
+ * @param {import('webdriverio').Browser} browser
+ * @param {object} match
+ * @param {object} config
+ */
+async function resolveMatch(browser, match, config) {
+  const resolveFn = browserResolveFromStamp()
+  return browser.execute(
+    resolveFn,
+    match.stamp,
+    config.locatorAttribute,
+    config.allowAncestorAttribute,
+    config.maxAncestorDepth
+  )
+}
+
+/**
+ * @param {import('webdriverio').Browser} browser
+ * @param {object} locator
+ * @param {object} uiStep
+ * @param {object} config
+ */
+async function performAction(browser, locator, uiStep, config) {
+  const el = await browser.$(locator.selector)
+  await el.waitForExist({ timeout: config.waitforTimeout || 10000 })
+  switch (uiStep.action) {
+    case 'click':
+      await el.waitForClickable({ timeout: config.waitforTimeout || 10000 })
+      await el.click()
+      break
+    case 'setValue':
+    case 'login-setValue':
+      await el.waitForDisplayed({ timeout: config.waitforTimeout || 10000 })
+      await el.clearValue()
+      await el.setValue(uiStep.value ?? '')
+      break
+    case 'clear':
+      await el.clearValue()
+      break
+    case 'select':
+      await el.selectByVisibleText(uiStep.value ?? '')
+      break
+    case 'check': {
+      const selected = await el.isSelected()
+      if (uiStep.value === 'check' && !selected) await el.click()
+      if (uiStep.value === 'uncheck' && selected) await el.click()
+      break
+    }
+    case 'assertVisible':
+      await el.waitForDisplayed({ timeout: config.waitforTimeout || 10000 })
+      break
+    default:
+      break
+  }
+}
+
+/**
+ * Login is a composite: open app (if needed) → username → password → submit.
+ * Each successful control is recorded as a locator.
+ *
+ * @param {import('webdriverio').Browser} browser
+ * @param {object} uiStep
+ * @param {object} config
+ * @param {string} baseUrl
+ */
+async function executeLogin(browser, uiStep, config, baseUrl) {
+  const locators = []
+  const gaps = []
+  const attr = config.locatorAttribute
+
+  const dest = uiStep.url || (baseUrl ? '/' : '')
+  if (dest || baseUrl) {
+    const current = await browser.getUrl().catch(() => '')
+    const blank =
+      !current ||
+      current === 'data:,' ||
+      current === 'about:blank' ||
+      current.startsWith('data:')
+    if (blank || uiStep.url) {
+      await browser.url(resolveUrl(dest || '/', baseUrl))
+    }
+  }
+
+  const fields = [
+    {
+      role: 'username',
+      action: 'setValue',
+      target: 'username',
+      value: uiStep.username ?? '',
+      required: true,
+    },
+    {
+      role: 'password',
+      action: 'setValue',
+      target: 'password',
+      value: uiStep.password ?? '',
+      required: true,
+    },
+    {
+      role: 'submit',
+      action: 'click',
+      target: 'login',
+      value: null,
+      required: true,
+    },
+  ]
+
+  for (const field of fields) {
+    const picked = await collectAndPick(
+      browser,
+      { action: field.action, target: field.target },
+      config,
+      attr
+    )
+    if (picked.ambiguous.length > 0) {
+      gaps.push({
+        reason: picked.gapReason,
+        role: field.role,
+        candidates: picked.ambiguous.map((c) => ({
+          stamp: c.stamp,
+          tagName: c.tagName,
+          text: c.text,
+          attr: c.attributes?.[attr],
+          anchorValue: c.anchorValue,
+        })),
+      })
+      if (config.onAmbiguousMatch === 'stop-scenario') {
+        return { locators, gaps, stopScenario: true }
       }
-    } else if (browserName.includes('firefox')) {
-      capability['moz:firefoxOptions'] = {
-        ...(capability['moz:firefoxOptions'] || {}),
-        args: [
-          ...new Set([
-            ...((capability['moz:firefoxOptions'] || {}).args || []),
-            '-headless',
-          ]),
-        ],
+      continue
+    }
+    if (!picked.match) {
+      gaps.push({
+        reason: picked.gapReason || `no ${field.role} field found`,
+        role: field.role,
+      })
+      continue
+    }
+    const locator = await resolveMatch(browser, picked.match, config)
+    if (locator.gap) {
+      gaps.push({ reason: locator.reason, role: field.role })
+      continue
+    }
+    locators.push({ ...locator, role: field.role })
+    try {
+      await performAction(
+        browser,
+        locator,
+        { action: field.action, value: field.value },
+        config
+      )
+    } catch (err) {
+      gaps.push({
+        reason: `action error on ${field.role}: ${err.message}`,
+        role: field.role,
+        locator,
+      })
+      if (config.onActionError === 'stop-scenario') {
+        return { locators, gaps, stopScenario: true }
       }
     }
   }
 
-  const browser = await remote({
-    protocol: wdioConfig.protocol,
-    hostname: wdioConfig.hostname || 'localhost',
-    port: wdioConfig.port || 4444,
-    path: wdioConfig.path,
-    user: wdioConfig.user,
-    key: wdioConfig.key,
-    logLevel: wdioConfig.logLevel || 'error',
-    baseUrl: wdioConfig.baseUrl,
-    capabilities: capability,
-    waitforTimeout: wdioConfig.waitforTimeout || 10000,
-    connectionRetryTimeout: wdioConfig.connectionRetryTimeout || 120000,
-    connectionRetryCount: wdioConfig.connectionRetryCount ?? 2,
-  })
-
-  return { browser, baseUrl: wdioConfig.baseUrl || '' }
+  return { locators, gaps, stopScenario: false }
 }
 
 /**
@@ -179,7 +396,6 @@ async function createBrowser(projectRoot, wdioConfigFile, wdioConfig, headless) 
  */
 async function executeStep(browser, uiStep, config, baseUrl) {
   const attr = config.locatorAttribute
-  /** @type {object} */
   const record = {
     action: uiStep.action,
     originalText: uiStep.originalText,
@@ -187,43 +403,48 @@ async function executeStep(browser, uiStep, config, baseUrl) {
     value: uiStep.value,
     url: null,
     locator: null,
+    locators: [],
     gap: null,
     pageKey: null,
   }
 
-  if (uiStep.action === 'navigate') {
-    const dest = uiStep.url || ''
-    const absolute =
-      /^https?:\/\//i.test(dest) || dest.startsWith('file:')
-        ? dest
-        : new URL(dest.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).href
-    await browser.url(absolute)
-    record.url = await browser.getUrl()
-    record.pageKey = pageNameFromUrl(record.url)
+  if (uiStep.action === 'observe') {
+    Object.assign(record, await currentPage(browser))
     return { ok: true, record, stopScenario: false }
+  }
+
+  if (uiStep.action === 'navigate') {
+    await browser.url(resolveUrl(uiStep.url || uiStep.target, baseUrl))
+    Object.assign(record, await currentPage(browser))
+    return { ok: true, record, stopScenario: false }
+  }
+
+  if (uiStep.action === 'login') {
+    const result = await executeLogin(browser, uiStep, config, baseUrl)
+    Object.assign(record, await currentPage(browser))
+    record.locators = result.locators
+    record.locator = result.locators[0] || null
+    if (result.gaps.length) {
+      record.gap = {
+        reason: result.gaps.map((g) => g.reason).join('; '),
+        details: result.gaps,
+      }
+    }
+    return {
+      ok: result.gaps.length === 0,
+      record,
+      stopScenario: result.stopScenario,
+    }
   }
 
   if (uiStep.action === 'unknown' || !uiStep.supported) {
     record.gap = {
       reason: `unsupported UI step grammar: "${uiStep.originalText}"`,
     }
-    return {
-      ok: false,
-      record,
-      stopScenario: false,
-    }
+    return { ok: false, record, stopScenario: false }
   }
 
-  const collectFn = browserCollectCandidates()
-  const candidates = await browser.execute(collectFn, attr)
-
-  const picked = pickBestCandidate(
-    candidates,
-    uiStep,
-    attr,
-    config.minScore,
-    config.ambiguityDelta
-  )
+  const picked = await collectAndPick(browser, uiStep, config, attr)
 
   if (picked.ambiguous.length > 0) {
     record.gap = {
@@ -252,15 +473,7 @@ async function executeStep(browser, uiStep, config, baseUrl) {
     }
   }
 
-  const resolveFn = browserResolveFromStamp()
-  const locator = await browser.execute(
-    resolveFn,
-    picked.match.stamp,
-    attr,
-    config.allowAncestorAttribute,
-    config.maxAncestorDepth
-  )
-
+  const locator = await resolveMatch(browser, picked.match, config)
   if (locator.gap) {
     record.gap = {
       reason: locator.reason,
@@ -278,44 +491,13 @@ async function executeStep(browser, uiStep, config, baseUrl) {
   }
 
   record.locator = locator
-  record.url = await browser.getUrl()
-  record.pageKey = pageNameFromUrl(record.url)
-
-  const el = await browser.$(locator.selector)
-  await el.waitForExist({ timeout: config.waitforTimeout || 10000 })
+  record.locators = [locator]
+  Object.assign(record, await currentPage(browser))
 
   try {
-    switch (uiStep.action) {
-      case 'click':
-        await el.click()
-        break
-      case 'setValue':
-        await el.clearValue()
-        await el.setValue(uiStep.value ?? '')
-        break
-      case 'clear':
-        await el.clearValue()
-        break
-      case 'select':
-        await el.selectByVisibleText(uiStep.value ?? '')
-        break
-      case 'check': {
-        const selected = await el.isSelected()
-        if (uiStep.value === 'check' && !selected) await el.click()
-        if (uiStep.value === 'uncheck' && selected) await el.click()
-        break
-      }
-      case 'assertVisible':
-        await el.waitForDisplayed({ timeout: config.waitforTimeout || 10000 })
-        break
-      default:
-        break
-    }
+    await performAction(browser, locator, uiStep, config)
   } catch (err) {
-    record.gap = {
-      reason: `action error: ${err.message}`,
-      locator,
-    }
+    record.gap = { reason: `action error: ${err.message}`, locator }
     return {
       ok: false,
       record,
@@ -323,7 +505,38 @@ async function executeStep(browser, uiStep, config, baseUrl) {
     }
   }
 
+  Object.assign(record, await currentPage(browser))
   return { ok: true, record, stopScenario: false }
+}
+
+function flattenLocators(trace) {
+  /** @type {Record<string, object[]>} */
+  const byPage = {}
+  for (const sc of trace.scenarios) {
+    for (const st of sc.steps) {
+      const items = [
+        ...(st.locators || []),
+        ...(st.locator && !(st.locators || []).length ? [st.locator] : []),
+      ]
+      for (const loc of items) {
+        if (!loc || !loc.selector) continue
+        const key = st.pageKey || 'page'
+        if (!byPage[key]) byPage[key] = []
+        byPage[key].push({
+          getterName: loc.getterName,
+          selector: loc.selector,
+          attrValue: loc.attrValue,
+          relativeCss: loc.relativeCss,
+          fragileRelative: loc.fragileRelative,
+          url: st.url,
+          action: st.action,
+          role: loc.role,
+          stepText: st.text,
+        })
+      }
+    }
+  }
+  return byPage
 }
 
 async function main() {
@@ -331,14 +544,19 @@ async function main() {
   if (args.help || !args.feature) {
     console.log(`Usage: node drive-feature.mjs --feature <path> [options]
 
+Opens Chrome via WebdriverIO/ChromeDriver and performs each UI step.
+
 Options:
   --project-root <dir>     WDIO project root (default: cwd)
   --out <dir>              Output directory for trace/gaps (default: .pom-discover)
   --config <file>          pom-discover config JSON
   --locator-attribute <a>  Override locator attribute
   --wdio-config <file>     Path to wdio.conf.*
+  --base-url <url>         App base URL (overrides wdio.conf baseUrl)
+  --start-url <url>        Open this URL before the first step
   --scenario <name>        Run only this scenario
-  --headed                 Run browser headed (default headless)`)
+  --headed                 Visible Chrome (default)
+  --headless               Run Chrome headless`)
     process.exit(args.help ? 0 : 1)
   }
 
@@ -353,12 +571,10 @@ Options:
 
   const config = loadConfig(projectRoot, args.config)
   if (args.locatorAttribute) config.locatorAttribute = args.locatorAttribute
+  const headless =
+    args.headless != null ? args.headless : config.headless === true
 
-  const feature = parseGherkin(
-    fs.readFileSync(featurePath, 'utf8'),
-    featurePath
-  )
-
+  const feature = parseGherkin(fs.readFileSync(featurePath, 'utf8'), featurePath)
   const scenarios = args.scenario
     ? feature.scenarios.filter((s) => s.name === args.scenario)
     : feature.scenarios
@@ -371,27 +587,22 @@ Options:
     projectRoot,
     args.wdioConfig
   )
-  if (wdioFile) {
-    console.error(`Using WDIO config: ${wdioFile}`)
-  } else {
-    console.error(
-      'No wdio.conf found; using defaults (chrome on localhost:4444). Prefer providing --wdio-config or a local Selenium/ChromeDriver endpoint.'
-    )
-  }
+  if (wdioFile) console.error(`Using WDIO config: ${wdioFile}`)
+  else console.error('No wdio.conf found; starting local Chrome via WebdriverIO.')
 
+  const baseUrl = args.baseUrl || wdioConfig.baseUrl || ''
   const outDir = path.isAbsolute(args.outDir)
     ? args.outDir
     : path.join(projectRoot, args.outDir)
   fs.mkdirSync(outDir, { recursive: true })
 
-  const { browser, baseUrl } = await createBrowser(
+  const { browser } = await createBrowser(
     projectRoot,
-    wdioFile,
     wdioConfig,
-    args.headless
+    headless,
+    baseUrl
   )
 
-  /** @type {object} */
   const trace = {
     featurePath,
     featureName: feature.name,
@@ -403,6 +614,10 @@ Options:
   const gaps = []
 
   try {
+    if (args.startUrl || baseUrl) {
+      await browser.url(resolveUrl(args.startUrl || '/', baseUrl))
+    }
+
     for (const scenario of scenarios) {
       const scenarioTrace = {
         name: scenario.name,
@@ -414,12 +629,14 @@ Options:
 
       const steps = stepsForScenario(feature, scenario)
       for (const step of steps) {
-        const uiStep = parseUiStep(step.text)
+        console.error(`→ ${step.keyword} ${step.text}`)
+        const uiStep = parseUiStep(step.text, step.tableMap || {})
         const result = await executeStep(browser, uiStep, config, baseUrl)
         scenarioTrace.steps.push({
           keyword: step.keyword,
           text: step.text,
           line: step.line,
+          tableMap: step.tableMap || {},
           ...result.record,
         })
 
@@ -448,30 +665,10 @@ Options:
 
   const tracePath = path.join(outDir, 'trace.json')
   const gapsPath = path.join(outDir, 'gaps.json')
+  const locatorsPath = path.join(outDir, 'locators.json')
+  const byPage = flattenLocators(trace)
   fs.writeFileSync(tracePath, JSON.stringify(trace, null, 2))
   fs.writeFileSync(gapsPath, JSON.stringify(gaps, null, 2))
-
-  // Flatten locators for merge script
-  /** @type {Record<string, object[]>} */
-  const byPage = {}
-  for (const sc of trace.scenarios) {
-    for (const st of sc.steps) {
-      if (!st.locator) continue
-      const key = st.pageKey || 'page'
-      if (!byPage[key]) byPage[key] = []
-      byPage[key].push({
-        getterName: st.locator.getterName,
-        selector: st.locator.selector,
-        attrValue: st.locator.attrValue,
-        relativeCss: st.locator.relativeCss,
-        fragileRelative: st.locator.fragileRelative,
-        url: st.url,
-        action: st.action,
-        stepText: st.text,
-      })
-    }
-  }
-  const locatorsPath = path.join(outDir, 'locators.json')
   fs.writeFileSync(locatorsPath, JSON.stringify(byPage, null, 2))
 
   console.log(

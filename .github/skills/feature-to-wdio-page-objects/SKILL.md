@@ -8,9 +8,9 @@ description: >
   objects, POM from feature, locators from Cucumber, feature-to-page-objects,
   test-automation-id locators, or merge page object getters from a feature path.
 compatibility: >
-  Requires Node.js, a WebdriverIO project with wdio.conf.* and a running
-  browser driver endpoint (or local Chrome via WDIO config), and network access
-  to the application under test.
+  Requires Node.js, webdriverio in the consumer project (starts local
+  ChromeDriver automatically), and network access to the application under test.
+  Do not assume a Selenium server on localhost:4444.
 ---
 
 # Feature-to-WDIO Page Objects
@@ -22,10 +22,10 @@ The user provides a **local path** to a `.feature` file (do **not** ask them to 
 ## Inputs to collect
 
 1. Feature path (e.g. `features/login.feature`) — required
-2. WDIO project root (default: workspace root) — must contain or resolve `wdio.conf.*`
-3. `locatorAttribute` (default from config / `test-automation-id`)
-4. Optional existing page object path to update (e.g. `pageobjects/login.page.ts`)
-5. Optional `--scenario` name to run a single scenario
+2. WDIO project root (default: workspace root) with `webdriverio` installed
+3. App `--base-url` or `wdio.conf` `baseUrl` so Chrome can open the app
+4. `locatorAttribute` (default from config / `test-automation-id`)
+5. Optional existing page object path to update (e.g. `pageobjects/login.page.ts`)
 
 Copy `config.example.json` to `pom-discover.config.json` in the project root if overrides are needed.
 
@@ -44,15 +44,20 @@ Copy `config.example.json` to `pom-discover.config.json` in the project root if 
 1. Confirm Node + project root. Prefer the consumer project's `webdriverio` dependency.
 2. Run the driver (from project root):
 
+This **opens Chrome via ChromeDriver** (visible window by default), walks each step, finds attributed elements, and **performs** the action before recording the locator.
+
 ```bash
 node .github/skills/feature-to-wdio-page-objects/scripts/drive-feature.mjs \
   --feature <path-to.feature> \
   --project-root . \
   --out .pom-discover \
-  --locator-attribute <attr>
+  --locator-attribute <attr> \
+  --base-url <app-url>
 ```
 
-Optional: `--page-object` is applied in the merge step, not the driver. Use `--scenario "Name"`, `--headed`, `--wdio-config path`, `--config pom-discover.config.json` as needed.
+- Default is **headed Chrome**. Pass `--headless` only if the user asks.
+- Do **not** start Selenium on port 4444. Omit hostname/port so WDIO starts ChromeDriver.
+- `--page-object` is applied in the merge step. Optional: `--scenario "Name"`, `--start-url`, `--wdio-config`, `--config`.
 
 3. Merge locators into page objects:
 
@@ -80,15 +85,35 @@ For the element chosen for a step:
 2. Else nearest ancestor within `maxAncestorDepth` with that attribute → `$('[attr="value"] <relativeCss>')`
 3. Else record a gap — do not substitute another strategy
 
-## UI step grammar supported by the driver
+## How each step is executed
 
-- Navigate: `I open "/path"`, `I go to "…"`, `I am on "…"`
-- Click: `I click "Save"`, `I click the "Save" button`
-- Type: `I enter "x" into "Email"`, `I type "x" in "Email"`
-- Select: `I select "CA" from "State"`
-- Clear: `I clear "Search"`
-- Check: `I check "Agree"` / `I uncheck "Agree"`
+For every step the driver:
+
+1. Opens/uses the Chrome session (started at `baseUrl` / `--start-url`)
+2. Collects only elements under `[locatorAttribute]`
+3. Scores them against the step text (quoted or unquoted: `I click submit`)
+4. Builds a strict locator and **performs** the action (`click`, `setValue`, …)
+5. Appends that locator to the trace
+
+**Login is composite.** `Given I login to <app>` plus a data table finds username, password, and submit — records all three locators and types/clicks them:
+
+```
+Given I login to Bla bla bla
+  | User     | Password   |
+  | UserName | Welcome123 |
+When I click submit
+Then I enter my name
+```
+
+## UI step grammar
+
+- Login: `I login to …` / `I log in` + `|User|Password|` table
+- Navigate: `I open "/path"`, `I go to "…"`
+- Click: `I click submit`, `I click "Save"`, `I click the Save button`
+- Type: `I enter my name` (value from table when present), `I enter "x" into "Email"`
+- Select / clear / check as before
 - Assert: `I should see "Welcome"`
+- Outcome-only (`Then this happens`) is observed, not failed as unsupported
 
 Unsupported steps are recorded as gaps and skipped (scenario continues unless policy says otherwise).
 

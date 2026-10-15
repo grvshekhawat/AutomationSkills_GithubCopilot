@@ -16,8 +16,9 @@ export const DEFAULT_CONFIG = {
   onMissingAttribute: 'record-gap-and-continue',
   onAmbiguousMatch: 'stop-scenario',
   onActionError: 'stop-scenario',
-  minScore: 40,
+  minScore: 25,
   ambiguityDelta: 10,
+  headless: false,
 }
 
 /**

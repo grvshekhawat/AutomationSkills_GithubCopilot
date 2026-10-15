@@ -1,6 +1,5 @@
 /**
- * Lightweight Gherkin parser for Feature / Scenario / Steps.
- * Does not evaluate tables or docs strings beyond capturing raw step text.
+ * Lightweight Gherkin parser for Feature / Scenario / Steps / data tables.
  */
 
 /**
@@ -9,6 +8,8 @@
  * @property {string} text - step text without keyword
  * @property {string} raw - full line
  * @property {number} line
+ * @property {string[][]} table - raw table rows (cells), empty if none
+ * @property {Record<string, string>} tableMap - first data row keyed by headers
  */
 
 /**
@@ -27,6 +28,44 @@
  * @property {ParsedScenario[]} scenarios
  * @property {string} sourcePath
  */
+
+/**
+ * @param {string} line
+ * @returns {string[]|null}
+ */
+export function parseTableRow(line) {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) return null
+  return trimmed
+    .slice(1, -1)
+    .split('|')
+    .map((c) => c.trim())
+}
+
+/**
+ * Map header row + data rows. Extra cells fill empty header values
+ * (handles `|UserName||Welcome123|` under `|User|Password|`).
+ *
+ * @param {string[][]} rows
+ * @returns {Record<string, string>}
+ */
+export function tableToMap(rows) {
+  if (!rows || rows.length < 2) return {}
+  const headers = rows[0]
+  const data = rows[1] || []
+  /** @type {Record<string, string>} */
+  const map = {}
+  headers.forEach((h, i) => {
+    map[h] = data[i] ?? ''
+  })
+  const extra = data.slice(headers.length).filter((c) => c !== '')
+  for (const h of headers) {
+    if ((map[h] == null || map[h] === '') && extra.length) {
+      map[h] = extra.shift()
+    }
+  }
+  return map
+}
 
 /**
  * @param {string} content
@@ -50,9 +89,10 @@ export function parseGherkin(content, sourcePath = '') {
   let mode = 'none'
   /** @type {ParsedScenario|null} */
   let currentScenario = null
+  /** @type {ParsedStep|null} */
+  let lastStep = null
 
   const stepRe = /^\s*(Given|When|Then|And|But)\s+(.+?)\s*$/i
-  const tagRe = /^\s*(@.+)$/
   const featureRe = /^\s*Feature:\s*(.*)$/i
   const backgroundRe = /^\s*Background:\s*(.*)$/i
   const scenarioRe = /^\s*Scenario(?: Outline)?:\s*(.*)$/i
@@ -65,13 +105,13 @@ export function parseGherkin(content, sourcePath = '') {
 
     if (!trimmed || trimmed.startsWith('#')) continue
 
-    const tagMatch = trimmed.match(tagRe)
-    if (tagMatch && !trimmed.includes(' ')) {
-      // single or multiple tags on one line
-      const tags = trimmed.split(/\s+/).filter((t) => t.startsWith('@'))
-      pendingTags.push(...tags)
+    const tableCells = parseTableRow(line)
+    if (tableCells && lastStep && (mode === 'background' || mode === 'scenario')) {
+      lastStep.table.push(tableCells)
+      lastStep.tableMap = tableToMap(lastStep.table)
       continue
     }
+
     if (trimmed.startsWith('@')) {
       pendingTags.push(
         ...trimmed.split(/\s+/).filter((t) => t.startsWith('@'))
@@ -85,6 +125,7 @@ export function parseGherkin(content, sourcePath = '') {
       feature.tags = pendingTags
       pendingTags = []
       mode = 'none'
+      lastStep = null
       continue
     }
 
@@ -92,6 +133,7 @@ export function parseGherkin(content, sourcePath = '') {
     if (backgroundMatch) {
       mode = 'background'
       currentScenario = null
+      lastStep = null
       pendingTags = []
       continue
     }
@@ -107,12 +149,14 @@ export function parseGherkin(content, sourcePath = '') {
       }
       feature.scenarios.push(currentScenario)
       pendingTags = []
+      lastStep = null
       continue
     }
 
     if (examplesRe.test(line)) {
       mode = 'none'
       currentScenario = null
+      lastStep = null
       continue
     }
 
@@ -123,11 +167,15 @@ export function parseGherkin(content, sourcePath = '') {
         text: stepMatch[2].trim(),
         raw: trimmed,
         line: lineNum,
+        table: [],
+        tableMap: {},
       }
       if (mode === 'background') {
         feature.background.push(step)
+        lastStep = step
       } else if (mode === 'scenario' && currentScenario) {
         currentScenario.steps.push(step)
+        lastStep = step
       }
       continue
     }

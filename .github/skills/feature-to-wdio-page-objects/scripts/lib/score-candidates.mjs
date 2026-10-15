@@ -87,6 +87,24 @@ function actionFit(action, c) {
   }
 }
 
+const SYNONYMS = {
+  submit: ['submit', 'login', 'signin', 'sign in', 'continue', 'save', 'ok'],
+  login: ['login', 'signin', 'sign in', 'submit', 'log in'],
+  user: ['user', 'username', 'userid', 'email', 'login'],
+  username: ['user', 'username', 'userid', 'email'],
+  password: ['password', 'pass', 'pwd', 'passwd'],
+  name: ['name', 'fullname', 'fullname', 'displayname'],
+}
+
+/**
+ * @param {string} target
+ */
+function targetPhrases(target) {
+  const n = norm(target)
+  const extra = SYNONYMS[n] || []
+  return [target, n, ...extra]
+}
+
 /**
  * @param {Candidate} c
  * @param {string} target
@@ -106,13 +124,17 @@ export function scoreCandidate(c, target, action, locatorAttribute) {
     ['name', c.attributes?.name || ''],
     ['placeholder', c.attributes?.placeholder || ''],
     ['title', c.attributes?.title || ''],
+    ['id', c.attributes?.id || ''],
+    ['type', c.attributes?.type || ''],
   ]
 
-  for (const [label, value] of parts) {
-    const s = includesScore(value, target)
-    if (s > 0) {
-      score += s
-      reasons.push(`${label}:${s}`)
+  for (const phrase of targetPhrases(target)) {
+    for (const [label, value] of parts) {
+      const s = includesScore(value, phrase)
+      if (s > 0) {
+        score += s
+        reasons.push(`${label}:${s}`)
+      }
     }
   }
 
