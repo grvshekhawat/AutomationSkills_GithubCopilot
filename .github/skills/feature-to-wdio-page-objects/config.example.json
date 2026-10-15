@@ -1,0 +1,18 @@
+{
+  "locatorAttribute": "test-automation-id",
+  "strict": true,
+  "allowAncestorAttribute": true,
+  "maxAncestorDepth": 8,
+  "featuresGlob": "features/**/*.feature",
+  "stepDefinitionsGlob": "step_definition/**/*.ts",
+  "pageObjectsDir": "pageobjects",
+  "pageObjectsGlob": "pageobjects/**/*.ts",
+  "generate": "locators-only",
+  "onExistingPageObject": "merge",
+  "preserveUnusedGetters": true,
+  "onMissingAttribute": "record-gap-and-continue",
+  "onAmbiguousMatch": "stop-scenario",
+  "onActionError": "stop-scenario",
+  "minScore": 40,
+  "ambiguityDelta": 10
+}
